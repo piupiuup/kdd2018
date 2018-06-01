@@ -1,0 +1,534 @@
+import os
+import time
+import pickle
+import hashlib
+import requests
+import datetime
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import lightgbm as lgb
+from io import StringIO
+from dateutil.parser import parse
+from datetime import date, timedelta
+from sklearn.preprocessing import LabelEncoder
+
+inplace = False
+cache_path = '../cache/'
+data_path = '../data/'
+station_dict = pd.read_csv('../data/station_dict.csv')
+
+##########################################基础工具包#######################################
+# 日期的加减
+def date_add_days(start_date, days):
+    end_date = parse(start_date[:10]) + timedelta(days=days)
+    end_date = end_date.strftime('%Y-%m-%d')
+    return end_date
+# 日期的加减
+def date_add_hours(start_date, hours):
+    end_date = parse(start_date) + timedelta(hours=hours)
+    end_date = end_date.strftime('%Y-%m-%d %H:%M:%S')
+    return end_date
+# 压缩数据降低精度
+def convert_dtypes(data,predictors,slient=False):
+    for c in predictors:
+        if data[c].dtypes == 'O':
+            try:
+                data[c] = data[c].astype('float32')
+            except:
+                if not slient:
+                    print('特征{}格式无法转换'.format(c))
+        if data[c].dtypes == 'float64':
+            data[c] = data[c].astype('float32')
+    return data
+
+##########################################aq数据更新#######################################
+def up_date():
+
+    # 北京aq数据（起始时间2018-03-31-16）
+    url = 'https://biendata.com/competition/airquality/bj/2018-03-31-16/2018-06-11-23/2k0d1d8'
+    # url = 'http://kdd.caiyunapp.com/competition/2k0d1d8/bj/2018-03-31-16/2018-06-11-23/airquality'
+    respones= requests.get(url)
+    with open (data_path + "bj_aq+.csv",'w') as f:
+        f.write(respones.text)
+
+    # 伦敦aq数据（起始时间2018-03-31-16）
+    url = 'https://biendata.com/competition/airquality/ld/2018-03-31-16/2018-06-11-23/2k0d1d8'
+    # url = 'http://kdd.caiyunapp.com/competition/2k0d1d8/ld/2018-03-31-16/2018-06-11-23/airquality'
+    respones= requests.get(url)
+    with open (data_path + "ld_aq+.csv",'w') as f:
+        f.write(respones.text)
+
+
+    bj_aq_more = pd.read_csv(data_path + 'bj_aq_more.csv')
+    bj_aq_1718 = pd.read_csv(data_path + 'beijing_17_18_aq.csv')
+    bj_aq_0203 = pd.read_csv(data_path + 'beijing_201802_201803_aq.csv')
+
+    ld_aq = pd.read_csv(data_path + 'London_historical_aqi_forecast_stations_20180331.csv',index_col=0)
+    ld_other = pd.read_csv(data_path + 'London_historical_aqi_other_stations_20180331.csv')
+
+
+    bj_aq = bj_aq_1718.append(bj_aq_0203).append(bj_aq_more)
+    del bj_aq_1718,bj_aq_0203,bj_aq_more
+    bj_aq.rename(columns={'stationId':'station_id','utc_time':'time'},inplace=True)
+    ld_aq.rename(columns={'MeasurementDateGMT':'time','PM2.5 (ug/m3)':'PM2.5','PM10 (ug/m3)':'PM10','NO2 (ug/m3)':'NO2'},inplace=True)
+    ld_aq['time'] = pd.to_datetime(ld_aq['time']).astype(str)
+    ld_aq_more = pd.read_csv(data_path+'ld_aq_more.csv')
+    ld_aq_more['time'] = pd.to_datetime(ld_aq_more['time']).astype(str)
+    ld_other.rename(columns={'MeasurementDateGMT':'time','PM2.5 (ug/m3)':'PM2.5','PM10 (ug/m3)':'PM10','NO2 (ug/m3)':'NO2','Station_ID':'station_id'},inplace=True)
+    ld_other.drop(['Unnamed: 5','Unnamed: 6'],axis=1,inplace=True)
+    ld_other['time'] = pd.to_datetime(ld_other['time']).astype(str)
+    ld_aq = ld_aq.append(ld_other).append(ld_aq_more)
+
+    bj_aq1 = pd.read_csv(data_path + 'bj_aq+.csv')
+    ld_aq1 = pd.read_csv(data_path + 'ld_aq+.csv')
+
+    del bj_aq1['id']
+    bj_aq1.rename(columns={'PM25_Concentration':'PM2.5','PM10_Concentration':'PM10','NO2_Concentration':'NO2',
+                           'CO_Concentration':'CO','O3_Concentration':'O3','SO2_Concentration':'SO2'},inplace=True)
+    bj_aq = bj_aq.append(bj_aq1)
+    bj_aq['station_id'] = bj_aq['station_id'].str[:-3]
+    del bj_aq1
+
+
+    ld_aq1.drop(['id','CO_Concentration','O3_Concentration','SO2_Concentration'],axis=1,inplace=True)
+    ld_aq1.rename(columns={'NO2_Concentration':'NO2','PM25_Concentration':'PM2.5','PM10_Concentration':'PM10'},inplace=True)
+    ld_aq = ld_aq.append(ld_aq1)
+
+
+
+    aq = bj_aq.append(ld_aq).drop_duplicates(['station_id','time'])
+    aq = aq[~aq['station_id'].isnull()]
+    aq.to_hdf(data_path+'aq.hdf','w', complib='blosc', complevel=5)
+
+
+    print('更新完毕....')
+
+
+
+##########################################grid数据更新（更新天气预报）#######################################
+# 更新api grid数据
+def update_meo_grid():
+
+    dates = [str(date)[:10] for date in pd.date_range('2018-04-07','2018-06-05')]
+    for date in dates:
+        if date > time.strftime("%Y-%m-%d", time.gmtime()):
+            continue
+        result_path = data_path + "meo_grid_{}.csv".format(date)
+        if not os.path.exists(result_path):
+            # 北京meo_grid数据（起始时间2018-04-09-22）
+            url = 'http://kdd.caiyunapp.com/competition/forecast/bj/{}-22/2k0d1d8'.format(date)
+            respones = requests.get(url)
+            if respones.text == 'None':
+                print('北京{}的数据api不存在'.format(date))
+            else:
+                bj_result = pd.read_csv(StringIO(respones.text))
+                bj_result.drop(['id', 'weather'], axis=1, inplace=True)
+                bj_result.rename(columns={'station_id': 'station_name', 'forecast_time': 'time'}, inplace=True)
+                bj_result = station_dict.merge(bj_result, on='station_name', how='inner')
+                del bj_result['station_name']
+                # result.to_csv(result_path, index=False)
+                print('正在更新北京{}的数据...'.format(date))
+
+            # 伦敦meo_grid数据（起始时间2018-04-09-22）
+            url = 'http://kdd.caiyunapp.com/competition/forecast/ld/{}-22/2k0d1d8'.format(date)
+            respones = requests.get(url)
+            if respones.text == 'None':
+                print('伦敦{}的数据api不存在'.format(date))
+            else:
+                ld_result = pd.read_csv(StringIO(respones.text))
+                ld_result.drop(['id', 'weather'], axis=1, inplace=True)
+                ld_result.rename(columns={'station_id': 'station_name', 'forecast_time': 'time'}, inplace=True)
+                ld_result = station_dict.merge(ld_result, on='station_name', how='inner')
+                del ld_result['station_name']
+                # result.to_csv(result_path,index=False)
+                print('正在更新伦敦{}的数据...'.format(date))
+                result = pd.concat([bj_result, ld_result])
+                if (date > '2018-04-07') & (date < '2018-04-23'):
+                    temp = result['wind_direction']
+                    result['wind_direction'] = result['wind_speed']
+                    result['wind_speed'] = temp
+                result.to_csv(result_path, index=False)
+        else:
+            print('{}的数据已存在'.format(date))
+
+# 更新历史grid数据
+def update_meo_grid2():
+    bj_meo_grid = pd.read_hdf(data_path + 'bj_meo_grid.hdf')
+    ld_meo_grid = pd.read_hdf(data_path + 'ld_meo_grid.hdf')
+
+    bj_meo_grid.drop(['latitude', 'longitude', 'weather'], axis=1, inplace=True)
+    ld_meo_grid.drop(['latitude', 'longitude', 'weather'], axis=1, inplace=True)
+    dates = [str(date)[:10] for date in pd.date_range('2017-01-01','2018-04-01')]
+    for date in dates:
+        start_time = date_add_hours(date, 0)[:10] + ' 23:00:00'
+        end_time = date_add_hours(date, 48)[:10] + ' 23:00:00'
+        result_path = data_path + "meo_grid_{}.csv".format(date)
+        if not os.path.exists(result_path):
+            try:
+                bj_result = bj_meo_grid[(bj_meo_grid['time']>=start_time) & (bj_meo_grid['time']<end_time)].copy()
+                bj_result = station_dict.merge(bj_result, on='station_name', how='inner')
+                del bj_result['station_name']
+                print('正在更新北京{}的数据...'.format(date))
+            except:
+                print('北京{}的数据更新失败'.format(date))
+            try:
+                ld_result = ld_meo_grid[(ld_meo_grid['time']>=start_time) & (ld_meo_grid['time']<end_time)].copy()
+                ld_result = station_dict.merge(ld_result, on='station_name', how='inner')
+                del ld_result['station_name']
+                print('正在更新伦敦{}的数据...'.format(date))
+            except:
+                print('伦敦{}的数据更新失败'.format(date))
+            result = pd.concat([bj_result, ld_result])
+            result.to_csv(result_path, index=False)
+        else:
+            print('{}的数据已存在'.format(date))
+
+
+
+
+
+aq = pd.read_hdf(data_path+'aq.hdf')
+temp = aq[['CO', 'NO2', 'O3', 'PM10', 'PM2.5', 'SO2']].copy()
+temp[temp<0] = np.nan
+aq[['CO', 'NO2', 'O3', 'PM10', 'PM2.5', 'SO2']] = temp
+aq2 = aq.copy()
+aq[['CO', 'NO2', 'O3', 'PM10', 'PM2.5', 'SO2']] = np.log(aq[['CO', 'NO2', 'O3', 'PM10', 'PM2.5', 'SO2']]+100)
+
+station_info = pd.read_csv(data_path+'station_info.csv')
+station_info['sitetype'] = LabelEncoder().fit_transform(station_info['sitetype'])
+holidays = pd.read_csv(data_path + 'holidays.csv')
+aq = aq.merge(station_info[['station_id','sitetype','city']],on='station_id',how='left')
+aq['hour'] = pd.to_datetime(aq['time']).dt.hour
+aq['date'] = aq['time'].str[:10]
+
+
+bj_station_id = ['aotizhongxin', 'badaling', 'beibuxinqu', 'daxing', 'dingling',
+       'donggaocun', 'dongsi', 'dongsihuan', 'fangshan', 'fengtaihuayuan',
+       'guanyuan', 'gucheng', 'huairou', 'liulihe', 'mentougou', 'miyun',
+       'miyunshuiku', 'nansanhuan', 'nongzhanguan', 'pingchang', 'pinggu',
+       'qianmen', 'shunyi', 'tiantan', 'tongzhou', 'wanliu',
+       'wanshouxigong', 'xizhimenbei', 'yanqin', 'yizhuang',
+       'yongdingmennei', 'yongledian', 'yufa', 'yungang', 'zhiwuyuan']
+ld_station_id = ['CD1', 'BL0', 'GR4', 'MY7', 'HV1', 'GN3', 'GR9', 'LW2', 'GN0',
+       'KF1', 'CD9', 'ST5', 'TH4', 'LH0', 'HR1', 'TD5', 'CT3', 'GB0',
+       'CR8', 'RB7', 'BX1', 'BX9', 'KC1', 'CT2']
+station_id = ['aotizhongxin', 'badaling', 'beibuxinqu', 'daxing', 'dingling',
+       'donggaocun', 'dongsi', 'dongsihuan', 'fangshan', 'fengtaihuayuan',
+       'guanyuan', 'gucheng', 'huairou', 'liulihe', 'mentougou', 'miyun',
+       'miyunshuiku', 'nansanhuan', 'nongzhanguan', 'pingchang', 'pinggu',
+       'qianmen', 'shunyi', 'tiantan', 'tongzhou', 'wanliu',
+       'wanshouxigong', 'xizhimenbei', 'yanqin', 'yizhuang',
+       'yongdingmennei', 'yongledian', 'yufa', 'yungang', 'zhiwuyuan',
+       'CD1', 'BL0', 'GR4', 'MY7', 'HV1', 'GN3', 'GR9', 'LW2', 'GN0',
+       'KF1', 'CD9', 'ST5', 'TH4', 'LH0', 'HR1', 'TD5', 'CT3', 'GB0',
+       'CR8', 'RB7', 'BX1', 'BX9', 'KC1', 'CT2'
+              ]
+stationName = ['beijing_grid_303', 'beijing_grid_303', 'beijing_grid_282', 'beijing_grid_303', 'beijing_grid_304',
+ 'beijing_grid_324',  'beijing_grid_283',  'beijing_grid_263', 'beijing_grid_262',  'beijing_grid_282', 'beijing_grid_239',
+ 'beijing_grid_261', 'beijing_grid_238','beijing_grid_301','beijing_grid_323','beijing_grid_366', 'beijing_grid_368',
+ 'beijing_grid_264', 'beijing_grid_240', 'beijing_grid_452', 'beijing_grid_349', 'beijing_grid_392', 'beijing_grid_225',
+ 'beijing_grid_265', 'beijing_grid_224', 'beijing_grid_414', 'beijing_grid_452', 'beijing_grid_385', 'beijing_grid_278',
+ 'beijing_grid_216', 'beijing_grid_303', 'beijing_grid_303', 'beijing_grid_283', 'beijing_grid_303', 'beijing_grid_324',
+ 'london_grid_472', 'london_grid_472', 'london_grid_409', 'london_grid_409', 'london_grid_388', 'london_grid_409',
+ 'london_grid_409', 'london_grid_408', 'london_grid_451', 'london_grid_451', 'london_grid_451', 'london_grid_430',
+ 'london_grid_451', 'london_grid_368', 'london_grid_472', 'london_grid_346', 'london_grid_388', 'london_grid_388',
+ 'london_grid_430', 'london_grid_452', 'london_grid_366', 'london_grid_408', 'london_grid_430', 'london_grid_388']
+
+############################### 工具函数 ###########################
+# 合并节约内存
+def concat(L):
+    result = None
+    for l in L:
+        if result is None:
+            result = l
+        else:
+            result[l.columns.tolist()] = l
+    return result
+# groupby 直接拼接
+def groupby(data,stat,key,value,func):
+    key = key if type(key)==list else [key]
+    data_temp = data[key].copy()
+    feat = stat.groupby(key,as_index=False)[value].agg({'feat':func})
+    data_temp = data_temp.merge(feat,on=key,how='left')
+    return data_temp['feat'].values
+# 相差的小时数
+def diff_of_hours(time1,time2):
+    hours = (parse(time1) - parse(time2)).total_seconds()//3600
+    return abs(hours)
+############################### 预处理函数 ###########################
+def pre_treatment(data_key):
+    result_path = cache_path + 'data_{}.hdf'.format(data_key)
+    if os.path.exists(result_path) & 1:
+        data = pd.read_hdf(result_path, 'w')
+    else:
+        times = pd.date_range(data_key,date_add_days(data_key,2),freq='H')[:-1]
+        data = pd.DataFrame(index=times,columns=station_id).unstack().reset_index().drop(0,axis=1)
+        data.columns = ['station_id','time']
+        data = data.merge(station_info, on='station_id', how='left')
+        data['hour'] = data['time'].dt.hour
+        data['month'] = data['time'].dt.month
+        data['year'] = data['time'].dt.year
+        data['day_of_week'] = data['time'].dt.dayofweek
+        data['day_of_month'] = data['time'].dt.day
+        data['day_of_year'] = data['time'].dt.dayofyear
+        data['time'] = data['time'].astype(str)
+        data['date'] = data['time'].str[:10]
+        data['diff_of_hour'] = (data['date']!=data_key).astype(int)*24+data['hour']
+        data = data.merge(holidays,on='date',how='left')
+        data.reset_index(drop=True, inplace=True)
+        data.to_hdf(result_path, 'w', complib='blosc', complevel=5)
+    return data
+
+
+############################### 预处理函数 ###########################
+# 24个小时前的数据
+def get_24hour_feat(data,data_key,replace):
+    result_path = cache_path + '24hour_feat_{}_{}hours_ago.hdf'.format(data_key,1)
+    if os.path.exists(result_path) & (not replace):
+        feat = pd.read_hdf(result_path, 'w')
+    else:
+        start_time = date_add_hours(data_key, -25)
+        end_time1 = date_add_hours(data_key, -1)
+        end_time0 = date_add_hours(data_key, -2)
+        bj_aq = aq[(aq['city']==1) & (aq['time'] < end_time1) & (aq['time'] >= start_time)].copy()
+        ld_aq = aq[(aq['city'] == 0) & (aq['time'] < end_time0) & (aq['time'] >= start_time)].copy()
+        data_temp = bj_aq.append(ld_aq)
+        feat = data[['station_id','city','sitetype']].copy()
+        for label in ['PM2.5','PM10','O3']:
+            result_temp = data_temp.set_index(['station_id', 'time'])[label].unstack()
+            result_temp.columns = ['{}_{}hour_last'.format(label,c[11:13]) for c in result_temp.columns]
+            feat = feat.merge(result_temp.reset_index(),on='station_id',how='left')
+        for label in ['PM2.5','PM10','O3']:
+            result_temp = data_temp.groupby(['city', 'time'])[label].mean().unstack()
+            result_temp.columns = ['{}_{}hour_last_city'.format(label,c[11:13]) for c in result_temp.columns]
+            feat = feat.merge(result_temp.reset_index(),on='city',how='left')
+        # for label in ['PM2.5','PM10','O3']:
+        #     result_temp = data_temp.groupby(['sitetype', 'time'])[label].mean().unstack()
+        #     result_temp.columns = ['{}_{}hour_last_sitetype'.format(label,c[11:13]) for c in result_temp.columns]
+        #     feat = feat.merge(result_temp.reset_index(),on='sitetype',how='left')
+        feat.to_hdf(result_path, 'w', complib='blosc', complevel=5)
+    return feat
+
+# 一个月内对应小时的值
+def get_nday_mean_feat(data,data_key,n,replace):
+    result_path = cache_path + '{}day_mean_feat{}_{}hours_age.hdf'.format(n,data_key,1)
+    if os.path.exists(result_path) & (not replace):
+        feat = pd.read_hdf(result_path, 'w')
+    else:
+        start_time = date_add_hours(data_key, -1-24*n)
+        end_time = date_add_hours(data_key, -1)
+        data_temp = aq[(aq['time']<end_time) & (aq['time']>=start_time)]
+        feat = data[['station_id','hour','date','city']].copy()
+        for label in ['PM2.5','PM10','O3']:
+            # feat['{}day_{}_mean'.format(n,label)] = groupby(feat,data_temp,['station_id'],label,np.mean)
+            # feat['{}day_{}_std'.format(n,label)] = groupby(feat, data_temp, ['station_id'], label, np.std)
+            feat['{}day_hour_{}_mean'.format(n,label)] = groupby(feat, data_temp, ['station_id','hour'], label, np.mean)
+        for label in ['PM2.5','PM10','O3']:
+            # feat['{}day_{}_mean_city'.format(n,label)] = groupby(feat,data_temp,['station_id'],label,np.mean)
+            # feat['{}day_{}_std_city'.format(n,label)] = groupby(feat, data_temp, ['station_id'], label, np.std)
+            feat['{}day_{}_mean_city'.format(n,label)] = groupby(feat, data_temp, ['city','date'], label, np.mean)
+        for label in ['PM2.5','PM10','O3']:
+            # feat['{}day_{}_mean_city'.format(n,label)] = groupby(feat,data_temp,['station_id'],label,np.mean)
+            # feat['{}day_{}_std_city'.format(n,label)] = groupby(feat, data_temp, ['station_id'], label, np.std)
+            feat['{}day_hour_{}_mean_city'.format(n,label)] = groupby(feat, data_temp, ['city','hour'], label, np.mean)
+        feat.to_hdf(result_path, 'w', complib='blosc', complevel=5)
+    return feat
+
+# 天气特征
+def get_weather_feat(data,data_key,replace):
+    result_path = cache_path + 'weather_feat{}.hdf'.format(data_key)
+    if os.path.exists(result_path) & (not replace):
+        feat = pd.read_hdf(result_path, 'w')
+    else:
+        data_temp = data[['station_id','time']].copy()
+        end_time = date_add_hours(data_key, -2)
+        try:
+            weather = pd.read_csv(r'C:\Users\csw\Desktop\python\kdd\data\meo_grid_api\meo_grid_{}.csv'.format(end_time[:10]))
+            date_time = data_temp['time'].copy()
+            feat_columns = weather.columns.copy()
+            for i in [-18,-12,-6,-4,-3,-2,-1,0,1,2,3]:
+                weather.columns = [c+'_ahead{}'.format(i) if c not in ['station_id','time'] else c for c in feat_columns]
+                data_temp['time'] = date_time.apply(lambda x: date_add_hours(x,i))
+                data_temp = data_temp.merge(weather,on=['station_id','time'],how='left')
+            data_temp['temperature_diff_1'] = data_temp['temperature_ahead0'] - data_temp['temperature_ahead-1']
+            data_temp['temperature_diff_2'] = data_temp['temperature_ahead0'] - data_temp['temperature_ahead-2']
+            data_temp['temperature_diff_21'] = data_temp['temperature_ahead-1'] - data_temp['temperature_ahead-2']
+            data_temp['temperature_diff_3'] = data_temp['temperature_ahead0'] - data_temp['temperature_ahead-3']
+            data_temp['temperature_diff_31'] = data_temp['temperature_ahead-2'] - data_temp['temperature_ahead-3']
+            data_temp['humidity_diff_1'] = (data_temp['humidity_ahead0'] - data_temp['humidity_ahead-1'])/data_temp['humidity_ahead0']
+            feat = data_temp.drop(['station_id','time'],axis=1)
+        except:
+            feat = pd.DataFrame()
+            print('{}的天气数据为空。'.format(end_time[:10]))
+        feat.to_hdf(result_path, 'w', complib='blosc', complevel=5)
+    return feat
+
+# 添加标签
+def get_label(result):
+    return result.merge(aq2[['station_id','time','PM2.5','PM10','O3']],on=['station_id','time'],how='left')
+
+# 二次处理特征
+def second_feat(result):
+    try:
+        result['PM2.5_22hour_last_city/PM2.5_21hour_last_city_rate'] = result['PM2.5_22hour_last_city'] / result['PM2.5_21hour_last_city']
+        result['PM10_22hour_last_city/PM10_21hour_last_city_rate'] = result['PM10_22hour_last'] / result['PM10_21hour_last_city']
+        result['O3_22hour_last/O3_21hour_last_rate'] = result['O3_22hour_last_city'] / result['O3_21hour_last_city']
+        result['PM2.5_21hour_last/PM2.5_20hour_last_rate'] = result['PM2.5_21hour_last']/result['PM2.5_20hour_last']
+        result['PM10_21hour_last/PM10_20hour_last_rate'] = result['PM10_21hour_last'] / result['PM10_20hour_last']
+        result['O3_21hour_last/O3_20hour_last_rate'] = result['O3_21hour_last'] / result['O3_20hour_last']
+        result['30day_PM2.5_mean/60day_PM2.5_mean_rate'] = result['30day_PM2.5_mean_city'] / result['60day_PM2.5_mean_city']
+        result['30day_PM10_mean/60day_PM10_mean_rate'] = result['30day_PM10_mean_city'] / result['60day_PM10_mean_city']
+        result['30day_O3_mean/60day_O3_mean_rate'] = result['30day_O3_mean_city'] / result['60day_O3_mean_city']
+        result['3day_PM2.5_mean/7day_PM2.5_mean_rate'] = result['3day_PM2.5_mean_city'] / result['7day_PM2.5_mean_city']
+        result['3day_PM10_mean/7day_PM10_mean_rate'] = result['3day_PM10_mean_city'] / result['7day_PM10_mean_city']
+        result['3day_O3_mean/7day_O3_mean_rate'] = result['3day_O3_mean_city'] / result['7day_O3_mean_city']
+        result['1day_PM2.5_mean_city/2day_PM2.5_mean_city_rate'] = result['1day_PM2.5_mean_city'] / result['2day_PM2.5_mean_city']
+        result['1day_PM10_mean_city/2day_PM10_mean_city_rate'] = result['1day_PM10_mean_city'] / result['2day_PM10_mean_city']
+        result['1day_O3_mean_city/2day_O3_mean_city_rate'] = result['1day_O3_mean_city'] / result['2day_O3_mean_city']
+    except:
+        pass
+    return result
+
+
+    return result
+
+def make_feat(data_key,silent=0,replace=False):
+    # data_key = hashlib.md5(data.to_string().encode()).hexdigest()
+    print(end='') if silent else print('数据key为：{}'.format(data_key))
+    result_path = cache_path + 'feat_set_{}_{}hour_ago.hdf'.format(data_key,1)
+    if os.path.exists(result_path) & (not replace):
+        result = pd.read_hdf(result_path, 'w')
+    else:
+        data = pre_treatment(data_key)
+
+        result = [data]
+        # print('开始构造特征...')
+        result.append(get_24hour_feat(data,data_key,replace))               # 24个小时前的数据
+        for i in [1,2,3,7,15,30,60,360]:
+            result.append(get_nday_mean_feat(data,data_key,i,replace))      # 一个月内对应小时的值
+        result.append(get_weather_feat(data, data_key,replace))             # 天气特征
+
+        # print('开始合并特征...')
+        result = concat(result)
+
+        result = second_feat(result)
+        # print('添加label')
+        result = get_label(result)
+        # print('存储数据...')
+        result = convert_dtypes(result, result.columns, slient=True)
+        result.to_hdf(result_path, 'w', complib='blosc', complevel=5)
+    print(end='') if silent else print('特征矩阵大小：{}'.format(result.shape))
+    # print('生成特征一共用时{}秒'.format(time.time() - t0))
+    return result
+
+
+up_date()
+update_meo_grid()
+update_meo_grid2()
+
+
+hours = 1
+data_feat = []
+start_date = '2018-05-05'
+days = 400
+data_feat_url = cache_path + 'data_feat_{}_{}days.hdf'.format(start_date,days)
+if os.path.exists(data_feat_url):
+    data_feat = pd.read_hdf(data_feat_url, 'w')
+else:
+    for i in tqdm(range(days)):
+        data_feat.append(make_feat(date_add_days(start_date, i*(-1))))
+    data_feat = pd.concat(data_feat,axis=0)
+    data_feat.to_hdf(data_feat_url, 'w', complib='blosc', complevel=5)
+
+train_feat = data_feat[data_feat['time']<'2018-04-10 00:00:00']
+eval_feat = data_feat[data_feat['time']>='2018-04-10 00:00:00']
+
+# weather_columns = []
+# for i in ['','','','','','']:
+
+predictors = [c for c in train_feat.columns if c not in (['station_id', 'time','date', 'PM2.5', 'PM10', 'O3','city','duoyun', 'yangsha', 'qing', 'fuchen', 'yin', 'zhenyu', 'zhenxue',
+       'yujiaxue', 'wu', 'mai'])]
+params = {
+    'learning_rate': 0.01,
+    'boosting_type': 'gbdt',
+    # 'objective': 'regression',
+    'application': 'mape',
+    'metric': 'map',
+    'sub_feature': 0.7,
+    'num_leaves': 60,
+    'min_data': 100,
+    'min_hessian': 1,
+    'verbose': -1,
+}
+model_dict = {}
+def f1(x): return np.log(x+1)
+def f2(x): return np.log(x+1)
+def f3(x): return np.log(x+100)
+def f4(x): return np.exp(x)-1
+def f5(x): return np.exp(x)-1
+def f6(x): return np.exp(x)-100
+encode = {'PM2.5':f1,'PM10':f2,'O3':f3}
+decode = {'PM2.5':f4,'PM10':f5,'O3':f6}
+for label in ['PM2.5','PM10','O3']:
+    lgb_train = lgb.Dataset(train_feat[train_feat[label] > 0][predictors],encode[label](train_feat[train_feat[label] > 0][label]))
+    lgb_eval = lgb.Dataset(eval_feat[eval_feat[label] > 0][predictors], encode[label](eval_feat[eval_feat[label] > 0][label]))
+
+    gbm = lgb.train(params,
+                    lgb_train,
+                    num_boost_round=5000,
+                    valid_sets=lgb_eval,
+                    verbose_eval = 100,
+                    early_stopping_rounds = 100)
+    feat_imp = pd.Series(gbm.feature_importance(), index=predictors).sort_values(ascending=False)
+    model_dict[label] = gbm
+
+pickle.dump((model_dict,predictors),open(data_path+'lightgbm_weather_best_eval.model','wb+'))
+model_dict,predictors = pickle.load(open(data_path+'lightgbm_weather_best_eval.model', 'rb+'))
+
+
+print('生成测试集')
+def get_test_feat(date):
+    test_feat = make_feat(date_add_days(date[:10],1),replace=True)
+    test_feat = pd.concat([train_feat[:0],test_feat])
+    return test_feat
+
+print('生成预测结果')
+def get_submission(test_feat,model_dict,decode):
+    for label in ['PM2.5', 'PM10', 'O3']:
+        pred = model_dict[label].predict(test_feat[predictors])
+        test_feat[label] = decode[label](pred)
+    test_feat['test_id'] = test_feat['station_id'].apply(lambda x: x if len(x)<11 else x[:10])
+    test_feat['test_id'] = list(map(lambda x,y: y if x==0 else y+'_aq', test_feat['city'],test_feat['test_id']))
+    test_feat['test_id'] = test_feat['test_id'] + '#' + test_feat['diff_of_hour'].astype(int).astype(str)
+    submission = pd.read_csv(data_path + 'sample_submissioin.csv')
+    submission = submission[['test_id']].merge(test_feat[['test_id','PM2.5','PM10','O3']],on='test_id',how='left')
+    if (submission[['PM2.5','PM10','O3']]<0).sum().sum()>0:
+        print('存在负数，请检查！！！')
+    return submission
+
+
+hours = 1
+utc_date = date_add_hours(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),-8)
+print('现在是UTC时间：{}'.format(utc_date))
+print('距离待预测时间还有{}个小时'.format(diff_of_hours(date_add_days(utc_date,1),utc_date)+1))
+
+test_feat = get_test_feat(utc_date)
+submission = get_submission(test_feat,model_dict, decode)
+
+sub_url = r'../submission/sub{}.csv'.format(datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+submission.to_csv(sub_url,index=False,  float_format='%.4f')
+print(submission[['PM2.5','PM10','O3']].mean())
+
+
+import requests
+files={'files': open(sub_url,'rb')}
+data = {
+    "user_id": "piupiu",
+    "team_token": "739a5c2029a031c0d0709ba0b7d438968a458b783420c4179f1ee1b8e7380d08",
+    "description": 'log1',
+    "filename": sub_url.split('\\')[-1],
+}
+url = 'https://biendata.com/competition/kdd_2018_submit/'
+response = requests.post(url, files=files, data=data)
+print(response.text)
